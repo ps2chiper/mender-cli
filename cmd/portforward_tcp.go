@@ -38,7 +38,7 @@ const (
 	portForwardTCPWindow      = 8
 	// v2 TCP frames are larger than the v1 4 KiB chunk. The Rust daemon
 	// accepts the matching limit for an opted-in v2 connection.
-	portForwardTCPReadBuffer = 16 * 1024
+	portForwardTCPReadBuffer = 7680
 )
 
 type TCPPortForwarder struct {
