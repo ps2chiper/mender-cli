@@ -87,6 +87,14 @@ type portMapping struct {
 	RemotePort uint16
 }
 
+// protoTypePortForwardV3 is the opt-in, flow-controlled v2 successor. It is
+// intentionally outside the upstream v1/v2 constants.
+const protoTypePortForwardV3 ws.ProtoType = ws.ProtoTypePortForwardV2 + 0x100
+
+func isFlowControlledPortForward(proto ws.ProtoType) bool {
+	return proto == ws.ProtoTypePortForwardV2 || proto == protoTypePortForwardV3
+}
+
 // portForwardNewBody mirrors wspf.PortForwardNew and adds the opt-in v2
 // flow-control flag. deviceconnect proxies preserve the body untouched, while
 // header properties are metadata and may be dropped by an intermediate proxy.
@@ -254,8 +262,14 @@ func (c *PortForwardCmd) run() error {
 			}
 			go forwarder.Run(ctx, c.sessionID, msgChan, c.recvChans)
 		case protocolUDP:
+			udpProto := c.proto
+			if udpProto == protoTypePortForwardV3 {
+				// v3 credit batching is TCP-only in the prototype; UDP keeps
+				// the stable v2 flow path.
+				udpProto = ws.ProtoTypePortForwardV2
+			}
 			forwarder, err := NewUDPPortForwarder(c.bindingHost, portMapping.LocalPort,
-				portMapping.RemoteHost, portMapping.RemotePort, c.proto)
+				portMapping.RemoteHost, portMapping.RemotePort, udpProto)
 			if err != nil {
 				return err
 			}
@@ -358,7 +372,9 @@ func (c *PortForwardCmd) handshake(client *deviceconnect.Client) error {
 	if err != nil {
 		return err
 	}
-	if slices.Contains(accept.Protocols, ws.ProtoTypePortForwardV2) {
+	if slices.Contains(accept.Protocols, protoTypePortForwardV3) {
+		c.proto = protoTypePortForwardV3
+	} else if slices.Contains(accept.Protocols, ws.ProtoTypePortForwardV2) {
 		c.proto = ws.ProtoTypePortForwardV2
 	} else if slices.Contains(accept.Protocols, ws.ProtoTypePortForward) {
 		c.proto = ws.ProtoTypePortForward
@@ -415,7 +431,7 @@ func (c *PortForwardCmd) processIncomingMessages(
 				c.running = false
 				c.Stop()
 			}
-		case c.proto:
+		case c.proto, ws.ProtoTypePortForwardV2:
 			switch m.Header.MsgType {
 			case wspf.MessageTypeError:
 				erro := new(ws.Error)

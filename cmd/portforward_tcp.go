@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"encoding/binary"
 	"context"
 	"errors"
 	"fmt"
@@ -107,7 +108,7 @@ func (p *TCPPortForwarder) Run(
 			}
 			connectionUUID, _ := uuid.NewUUID()
 			connectionID := connectionUUID.String()
-			if p.proto == ws.ProtoTypePortForwardV2 {
+			if isFlowControlledPortForward(p.proto) {
 				connectionID += ":flow"
 			}
 			recvChan := make(chan *ws.ProtoMsg, portForwardTCPChannelSize)
@@ -160,7 +161,7 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 						fmt.Fprintf(os.Stderr, "error: %v\n", err.Error())
 					}
 				} else if p.proto == ws.ProtoTypePortForward ||
-					p.proto == ws.ProtoTypePortForwardV2 {
+					isFlowControlledPortForward(p.proto) {
 					// v1 and v2 both use an ACK for flow control.
 					m := &ws.ProtoMsg{
 						Header: ws.ProtoHdr{
@@ -176,15 +177,21 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 				}
 
 			case wspf.MessageTypePortForwardAck:
-				// Release one send credit. v1 has one credit; the
-				// flow-controlled v2 path has a bounded window.
+				// v3 batches input-frame ACKs; the body carries the number
+				// of credits released. v1/v2 use one credit.
+				count := 1
+				if p.proto == protoTypePortForwardV3 && len(m.Body) >= 4 {
+					count = int(binary.BigEndian.Uint32(m.Body[:4]))
+				}
 				p.ackMu.RLock()
 				credits, ok := p.ackCredits[connectionID]
 				p.ackMu.RUnlock()
 				if ok {
-					select {
-					case credits <- struct{}{}:
-					default:
+					for i := 0; i < count; i++ {
+						select {
+						case credits <- struct{}{}:
+						default:
+						}
 					}
 				}
 
@@ -209,7 +216,7 @@ func (p *TCPPortForwarder) handleRequest(
 	defer conn.Close()
 
 	window := 1
-	if p.proto == ws.ProtoTypePortForwardV2 {
+	if isFlowControlledPortForward(p.proto) {
 		window = portForwardTCPWindow
 	}
 	credits := make(chan struct{}, window)
@@ -233,7 +240,7 @@ func (p *TCPPortForwarder) handleRequest(
 		Protocol:    &protocol,
 		RemoteHost:  &p.remoteHost,
 		RemotePort:  &p.remotePort,
-		FlowControl: p.proto == ws.ProtoTypePortForwardV2,
+		FlowControl: isFlowControlledPortForward(p.proto),
 	}
 	body, err := msgpack.Marshal(portforwardNew)
 	if err != nil {
@@ -320,7 +327,7 @@ func (p *TCPPortForwarder) handleRequestConnection(
 	conn net.Conn,
 ) {
 	readLength := readBuffLength
-	if p.proto == ws.ProtoTypePortForwardV2 {
+	if isFlowControlledPortForward(p.proto) {
 		readLength = portForwardTCPReadBuffer
 	}
 	data := make([]byte, readLength)

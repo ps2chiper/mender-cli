@@ -15,6 +15,7 @@
 package cmd
 
 import (
+	"encoding/binary"
 	"context"
 	"fmt"
 	"io"
@@ -91,13 +92,13 @@ func (p *UDPPortForwarder) Run(
 
 	connectionUUID, _ := uuid.NewUUID()
 	connectionID := connectionUUID.String()
-	if p.proto == ws.ProtoTypePortForwardV2 {
+	if isFlowControlledPortForward(p.proto) {
 		connectionID += ":flow"
 	}
 	recvChan := make(chan *ws.ProtoMsg, portForwardUDPChannelSize)
 	recvChans[connectionID] = recvChan
 	window := 1
-	if p.proto == ws.ProtoTypePortForwardV2 {
+	if isFlowControlledPortForward(p.proto) {
 		window = portForwardUDPWindow
 	}
 	p.ackCredits = make(chan struct{}, window)
@@ -110,7 +111,7 @@ func (p *UDPPortForwarder) Run(
 		Protocol:    &protocol,
 		RemoteHost:  &p.remoteHost,
 		RemotePort:  &p.remotePort,
-		FlowControl: p.proto == ws.ProtoTypePortForwardV2,
+		FlowControl: isFlowControlledPortForward(p.proto),
 	}
 	body, err := msgpack.Marshal(portforwardNew)
 	if err != nil {
@@ -189,11 +190,18 @@ func (p *UDPPortForwarder) Run(
 						msgChan <- m
 					}
 				} else if (m.Header.Proto == ws.ProtoTypePortForward ||
-					m.Header.Proto == ws.ProtoTypePortForwardV2) &&
+					m.Header.Proto == ws.ProtoTypePortForwardV2 ||
+					m.Header.Proto == protoTypePortForwardV3) &&
 					m.Header.MsgType == wspf.MessageTypePortForwardAck {
-					select {
-					case p.ackCredits <- struct{}{}:
-					default:
+					count := 1
+					if m.Header.Proto == protoTypePortForwardV3 && len(m.Body) >= 4 {
+						count = int(binary.BigEndian.Uint32(m.Body[:4]))
+					}
+					for i := 0; i < count; i++ {
+						select {
+						case p.ackCredits <- struct{}{}:
+						default:
+						}
 					}
 				}
 			case <-ctx.Done():
@@ -212,7 +220,7 @@ func (p *UDPPortForwarder) Run(
 			return
 		case data := <-dataChan:
 			if p.proto == ws.ProtoTypePortForward ||
-				p.proto == ws.ProtoTypePortForwardV2 {
+				isFlowControlledPortForward(p.proto) {
 				// Acquire a bounded window slot. v1 uses one slot;
 				// v2 can keep up to 3 datagrams in flight.
 				<-p.ackCredits
