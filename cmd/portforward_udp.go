@@ -30,16 +30,19 @@ import (
 	"github.com/vmihailenco/msgpack"
 )
 
-const portForwardUDPChannelSize = 20
+const (
+	portForwardUDPChannelSize = 20
+	portForwardUDPWindow      = 3
+)
 
 type UDPPortForwarder struct {
-	conn          *net.UDPConn
-	remoteHost    string
-	remotePort    uint16
-	sourceAddr    *net.UDPAddr
-	sourceMu      sync.RWMutex
-	waitGroupAcks *sync.WaitGroup
-	proto         ws.ProtoType
+	conn       *net.UDPConn
+	remoteHost string
+	remotePort uint16
+	sourceAddr *net.UDPAddr
+	sourceMu   sync.RWMutex
+	ackCredits chan struct{}
+	proto      ws.ProtoType
 }
 
 func NewUDPPortForwarder(
@@ -64,12 +67,16 @@ func NewUDPPortForwarder(
 	if err != nil {
 		return nil, err
 	}
+	// A local UDP sender can burst far faster than the WebSocket credit
+	// window drains. Keep the kernel receive queue from truncating an
+	// otherwise deliverable burst.
+	_ = conn.SetReadBuffer(4 * 1024 * 1024)
+	_ = conn.SetWriteBuffer(4 * 1024 * 1024)
 	return &UDPPortForwarder{
-		proto:         proto,
-		conn:          conn,
-		remoteHost:    remoteHost,
-		remotePort:    remotePort,
-		waitGroupAcks: &sync.WaitGroup{},
+		proto:      proto,
+		conn:       conn,
+		remoteHost: remoteHost,
+		remotePort: remotePort,
 	}, nil
 }
 
@@ -89,6 +96,14 @@ func (p *UDPPortForwarder) Run(
 	}
 	recvChan := make(chan *ws.ProtoMsg, portForwardUDPChannelSize)
 	recvChans[connectionID] = recvChan
+	window := 1
+	if p.proto == ws.ProtoTypePortForwardV2 {
+		window = portForwardUDPWindow
+	}
+	p.ackCredits = make(chan struct{}, window)
+	for i := 0; i < window; i++ {
+		p.ackCredits <- struct{}{}
+	}
 
 	protocol := portforward.PortForwardProtocol(wspf.PortForwardProtocolUDP)
 	portforwardNew := &portForwardNewBody{
@@ -176,7 +191,10 @@ func (p *UDPPortForwarder) Run(
 				} else if (m.Header.Proto == ws.ProtoTypePortForward ||
 					m.Header.Proto == ws.ProtoTypePortForwardV2) &&
 					m.Header.MsgType == wspf.MessageTypePortForwardAck {
-					p.waitGroupAcks.Add(-1)
+					select {
+					case p.ackCredits <- struct{}{}:
+					default:
+					}
 				}
 			case <-ctx.Done():
 				return
@@ -195,10 +213,9 @@ func (p *UDPPortForwarder) Run(
 		case data := <-dataChan:
 			if p.proto == ws.ProtoTypePortForward ||
 				p.proto == ws.ProtoTypePortForwardV2 {
-				// One in-flight datagram. v1 and v2 both acknowledge
-				// forwarded data; v2 uses the ACK for flow control.
-				p.waitGroupAcks.Wait()
-				p.waitGroupAcks.Add(1)
+				// Acquire a bounded window slot. v1 uses one slot;
+				// v2 can keep up to 3 datagrams in flight.
+				<-p.ackCredits
 			}
 
 			m := &ws.ProtoMsg{

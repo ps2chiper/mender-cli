@@ -33,13 +33,17 @@ import (
 	"github.com/vmihailenco/msgpack"
 )
 
-const portForwardTCPChannelSize = 20
+const (
+	portForwardTCPChannelSize = 20
+	portForwardTCPWindow      = 8
+)
 
 type TCPPortForwarder struct {
 	listen     net.Listener
 	remoteHost string
 	remotePort uint16
-	mutexAck   map[string]*sync.Mutex
+	ackCredits map[string]chan struct{}
+	ackMu      sync.RWMutex
 	proto      ws.ProtoType
 }
 
@@ -59,7 +63,7 @@ func NewTCPPortForwarder(
 		listen:     listen,
 		remoteHost: remoteHost,
 		remotePort: remotePort,
-		mutexAck:   map[string]*sync.Mutex{},
+		ackCredits: map[string]chan struct{}{},
 		proto:      proto,
 	}, nil
 }
@@ -165,10 +169,16 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 				}
 
 			case wspf.MessageTypePortForwardAck:
-				// Release the one-frame send credit. This is used by both
-				// v1 and the flow-controlled v2 path.
-				if ack, ok := p.mutexAck[connectionID]; ok {
-					ack.Unlock()
+				// Release one send credit. v1 has one credit; the
+				// flow-controlled v2 path has a bounded window.
+				p.ackMu.RLock()
+				credits, ok := p.ackCredits[connectionID]
+				p.ackMu.RUnlock()
+				if ok {
+					select {
+					case credits <- struct{}{}:
+					default:
+					}
 				}
 
 			default:
@@ -191,9 +201,21 @@ func (p *TCPPortForwarder) handleRequest(
 ) {
 	defer conn.Close()
 
-	p.mutexAck[connectionID] = &sync.Mutex{}
+	window := 1
+	if p.proto == ws.ProtoTypePortForwardV2 {
+		window = portForwardTCPWindow
+	}
+	credits := make(chan struct{}, window)
+	for i := 0; i < window; i++ {
+		credits <- struct{}{}
+	}
+	p.ackMu.Lock()
+	p.ackCredits[connectionID] = credits
+	p.ackMu.Unlock()
 	defer func() {
-		delete(p.mutexAck, connectionID)
+		p.ackMu.Lock()
+		delete(p.ackCredits, connectionID)
+		p.ackMu.Unlock()
 	}()
 
 	errChan := make(chan error)
@@ -257,12 +279,14 @@ func (p *TCPPortForwarder) handleRequest(
 			}
 			return
 		case data := <-dataChan:
-			if p.proto == ws.ProtoTypePortForward ||
-				p.proto == ws.ProtoTypePortForwardV2 {
-				// One in-flight data frame per connection. v1 and v2 both
-				// acknowledge forwarded data; v2 uses the same ACK for flow
-				// control without the v1 message sequence.
-				p.mutexAck[connectionID].Lock()
+			p.ackMu.RLock()
+			credits, ok := p.ackCredits[connectionID]
+			p.ackMu.RUnlock()
+			if ok {
+				// Acquire a bounded window slot. v1 uses one slot; v2
+				// uses a wider window so the WAN round trip is not paid
+				// for every 4 KiB frame.
+				<-credits
 			}
 
 			m := &ws.ProtoMsg{
