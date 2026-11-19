@@ -87,6 +87,16 @@ type portMapping struct {
 	RemotePort uint16
 }
 
+// portForwardNewBody mirrors wspf.PortForwardNew and adds the opt-in v2
+// flow-control flag. deviceconnect proxies preserve the body untouched, while
+// header properties are metadata and may be dropped by an intermediate proxy.
+type portForwardNewBody struct {
+	RemoteHost  *string                   `msgpack:"remote_host"`
+	RemotePort  *uint16                   `msgpack:"remote_port"`
+	Protocol    *wspf.PortForwardProtocol `msgpack:"protocol"`
+	FlowControl bool                      `msgpack:"flow_control,omitempty"`
+}
+
 // PortForwardCmd handles the port-forward command
 type PortForwardCmd struct {
 	proto        ws.ProtoType
@@ -419,13 +429,15 @@ func (c *PortForwardCmd) processIncomingMessages(
 					c.Stop()
 				}
 			case wspf.MessageTypePortForwardAck:
-				if c.proto == ws.ProtoTypePortForwardV2 {
-					c.err = fmt.Errorf("invalid message type %s", m.Header.MsgType)
-					c.running = false
-					c.Stop()
-					break
+				// v1 and v2 both carry the ACK for flow control. v2 keeps
+				// the ACK body empty, but it must still reach the matching
+				// connection so the sender can release one credit.
+				connectionID, _ := m.Header.Properties[wspf.PropertyConnectionID].(string)
+				if connectionID != "" {
+					if recvChan, ok := c.recvChans[connectionID]; ok {
+						recvChan <- m
+					}
 				}
-				fallthrough
 			case wspf.MessageTypePortForward,
 				wspf.MessageTypePortForwardStop,
 				wspf.MessageTypePortForwardNew:

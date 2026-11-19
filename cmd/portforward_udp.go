@@ -37,6 +37,7 @@ type UDPPortForwarder struct {
 	remoteHost    string
 	remotePort    uint16
 	sourceAddr    *net.UDPAddr
+	sourceMu      sync.RWMutex
 	waitGroupAcks *sync.WaitGroup
 	proto         ws.ProtoType
 }
@@ -83,14 +84,18 @@ func (p *UDPPortForwarder) Run(
 
 	connectionUUID, _ := uuid.NewUUID()
 	connectionID := connectionUUID.String()
+	if p.proto == ws.ProtoTypePortForwardV2 {
+		connectionID += ":flow"
+	}
 	recvChan := make(chan *ws.ProtoMsg, portForwardUDPChannelSize)
 	recvChans[connectionID] = recvChan
 
 	protocol := portforward.PortForwardProtocol(wspf.PortForwardProtocolUDP)
-	portforwardNew := &wspf.PortForwardNew{
-		Protocol:   &protocol,
-		RemoteHost: &p.remoteHost,
-		RemotePort: &p.remotePort,
+	portforwardNew := &portForwardNewBody{
+		Protocol:    &protocol,
+		RemoteHost:  &p.remoteHost,
+		RemotePort:  &p.remotePort,
+		FlowControl: p.proto == ws.ProtoTypePortForwardV2,
 	}
 	body, err := msgpack.Marshal(portforwardNew)
 	if err != nil {
@@ -144,11 +149,18 @@ func (p *UDPPortForwarder) Run(
 					return
 				} else if m.Header.Proto == p.proto &&
 					m.Header.MsgType == wspf.MessageTypePortForward {
-					_, err := p.conn.WriteToUDP(m.Body, p.sourceAddr)
+					p.sourceMu.RLock()
+					sourceAddr := p.sourceAddr
+					p.sourceMu.RUnlock()
+					if sourceAddr == nil {
+						continue
+					}
+					_, err := p.conn.WriteToUDP(m.Body, sourceAddr)
 					if err != nil {
 						fmt.Fprintf(os.Stderr, "error: %v\n", err.Error())
-					} else if p.proto == ws.ProtoTypePortForward {
-						// send the ack
+					} else if p.proto == ws.ProtoTypePortForward ||
+						p.proto == ws.ProtoTypePortForwardV2 {
+						// send the ack (v1 and flow-controlled v2)
 						m := &ws.ProtoMsg{
 							Header: ws.ProtoHdr{
 								Proto:     p.proto,
@@ -161,7 +173,8 @@ func (p *UDPPortForwarder) Run(
 						}
 						msgChan <- m
 					}
-				} else if m.Header.Proto == ws.ProtoTypePortForward &&
+				} else if (m.Header.Proto == ws.ProtoTypePortForward ||
+					m.Header.Proto == ws.ProtoTypePortForwardV2) &&
 					m.Header.MsgType == wspf.MessageTypePortForwardAck {
 					p.waitGroupAcks.Add(-1)
 				}
@@ -180,11 +193,11 @@ func (p *UDPPortForwarder) Run(
 			}
 			return
 		case data := <-dataChan:
-			if p.proto == ws.ProtoTypePortForward {
-				// wait to receive all the previous acks
+			if p.proto == ws.ProtoTypePortForward ||
+				p.proto == ws.ProtoTypePortForwardV2 {
+				// One in-flight datagram. v1 and v2 both acknowledge
+				// forwarded data; v2 uses the ACK for flow control.
 				p.waitGroupAcks.Wait()
-
-				// add an expected ack to the wait group
 				p.waitGroupAcks.Add(1)
 			}
 
@@ -216,7 +229,9 @@ func (p *UDPPortForwarder) handleRequestConnection(dataChan chan []byte, errChan
 			break
 		}
 		if n > 0 {
+			p.sourceMu.Lock()
 			p.sourceAddr = udpAddr
+			p.sourceMu.Unlock()
 			tmp := make([]byte, n)
 			copy(tmp, data[:n])
 			dataChan <- tmp

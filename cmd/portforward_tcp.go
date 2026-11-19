@@ -96,6 +96,9 @@ func (p *TCPPortForwarder) Run(
 		case conn := <-acceptedConnections:
 			connectionUUID, _ := uuid.NewUUID()
 			connectionID := connectionUUID.String()
+			if p.proto == ws.ProtoTypePortForwardV2 {
+				connectionID += ":flow"
+			}
 			recvChan := make(chan *ws.ProtoMsg, portForwardTCPChannelSize)
 			recvChans[connectionID] = recvChan
 			go p.handleRequest(ctx, conn, sessionID, connectionID, recvChan, msgChan)
@@ -129,18 +132,28 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 				go p.handleRequestConnection(dataChan, errChan, conn)
 				started = true
 
-			case wspf.MessageTypePortForwardStop,
-				wspf.MessageTypePortForward:
+			case wspf.MessageTypePortForwardStop:
+				// A stop is the peer's EOF. Flush any body first, then close
+				// the local side so the application sees EOF instead of a
+				// silently stalled tunnel.
+				if len(m.Body) != 0 {
+					_, _ = conn.Write(m.Body)
+				}
+				_ = conn.Close()
+				return
+
+			case wspf.MessageTypePortForward:
 				_, err := conn.Write(m.Body)
 				if err != nil {
 					if errors.Unwrap(err) != net.ErrClosed {
 						fmt.Fprintf(os.Stderr, "error: %v\n", err.Error())
 					}
-				} else if p.proto == ws.ProtoTypePortForward {
-					// send the ack
+				} else if p.proto == ws.ProtoTypePortForward ||
+					p.proto == ws.ProtoTypePortForwardV2 {
+					// v1 and v2 both use an ACK for flow control.
 					m := &ws.ProtoMsg{
 						Header: ws.ProtoHdr{
-							Proto:     ws.ProtoTypePortForward,
+							Proto:     p.proto,
 							MsgType:   wspf.MessageTypePortForwardAck,
 							SessionID: sessionID,
 							Properties: map[string]interface{}{
@@ -152,13 +165,12 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 				}
 
 			case wspf.MessageTypePortForwardAck:
-				if p.proto == ws.ProtoTypePortForward {
-					if m, ok := p.mutexAck[connectionID]; ok {
-						m.Unlock()
-					}
-					break
+				// Release the one-frame send credit. This is used by both
+				// v1 and the flow-controlled v2 path.
+				if ack, ok := p.mutexAck[connectionID]; ok {
+					ack.Unlock()
 				}
-				fallthrough
+
 			default:
 				fmt.Fprintf(os.Stderr, "error: unrecognized message type %s\n",
 					m.Header.MsgType)
@@ -188,10 +200,11 @@ func (p *TCPPortForwarder) handleRequest(
 	dataChan := make(chan []byte)
 
 	protocol := portforward.PortForwardProtocol(wspf.PortForwardProtocolTCP)
-	portforwardNew := &wspf.PortForwardNew{
-		Protocol:   &protocol,
-		RemoteHost: &p.remoteHost,
-		RemotePort: &p.remotePort,
+	portforwardNew := &portForwardNewBody{
+		Protocol:    &protocol,
+		RemoteHost:  &p.remoteHost,
+		RemotePort:  &p.remotePort,
+		FlowControl: p.proto == ws.ProtoTypePortForwardV2,
 	}
 	body, err := msgpack.Marshal(portforwardNew)
 	if err != nil {
@@ -244,8 +257,11 @@ func (p *TCPPortForwarder) handleRequest(
 			}
 			return
 		case data := <-dataChan:
-			if p.proto == ws.ProtoTypePortForward {
-				// lock the ack mutex, we don't allow more than one in-flight message
+			if p.proto == ws.ProtoTypePortForward ||
+				p.proto == ws.ProtoTypePortForwardV2 {
+				// One in-flight data frame per connection. v1 and v2 both
+				// acknowledge forwarded data; v2 uses the same ACK for flow
+				// control without the v1 message sequence.
 				p.mutexAck[connectionID].Lock()
 			}
 
