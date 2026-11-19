@@ -36,6 +36,9 @@ import (
 const (
 	portForwardTCPChannelSize = 20
 	portForwardTCPWindow      = 8
+	// v2 TCP frames are larger than the v1 4 KiB chunk. The Rust daemon
+	// accepts the matching limit for an opted-in v2 connection.
+	portForwardTCPReadBuffer = 16 * 1024
 )
 
 type TCPPortForwarder struct {
@@ -98,6 +101,10 @@ func (p *TCPPortForwarder) Run(
 	for {
 		select {
 		case conn := <-acceptedConnections:
+			if tcpConn, ok := conn.(*net.TCPConn); ok {
+				_ = tcpConn.SetReadBuffer(4 * 1024 * 1024)
+				_ = tcpConn.SetWriteBuffer(4 * 1024 * 1024)
+			}
 			connectionUUID, _ := uuid.NewUUID()
 			connectionID := connectionUUID.String()
 			if p.proto == ws.ProtoTypePortForwardV2 {
@@ -312,7 +319,11 @@ func (p *TCPPortForwarder) handleRequestConnection(
 	errChan chan<- error,
 	conn net.Conn,
 ) {
-	data := make([]byte, readBuffLength)
+	readLength := readBuffLength
+	if p.proto == ws.ProtoTypePortForwardV2 {
+		readLength = portForwardTCPReadBuffer
+	}
+	data := make([]byte, readLength)
 
 	for {
 		n, err := conn.Read(data)
