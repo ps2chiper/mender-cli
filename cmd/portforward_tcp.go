@@ -43,6 +43,63 @@ const (
 	portForwardTCPReadBuffer = 7680
 )
 
+// errLocalHalfClose tells handleRequest that the client has finished sending
+// but the local accepted connection must stay open for the target's response.
+var errLocalHalfClose = errors.New("local half-close")
+
+// halfCloseTracker serializes the two independent TCP half-closes. A v3
+// connection is finished only when both directions are closed, or when the
+// peer explicitly sends stop.
+type halfCloseTracker struct {
+	mu       sync.Mutex
+	local    bool
+	remote   bool
+	stopped  bool
+	finished bool
+	done     chan struct{}
+}
+
+func newHalfCloseTracker() *halfCloseTracker {
+	return &halfCloseTracker{done: make(chan struct{})}
+}
+
+func (t *halfCloseTracker) finishLocked() {
+	if t.finished {
+		return
+	}
+	if t.stopped || (t.local && t.remote) {
+		t.finished = true
+		close(t.done)
+	}
+}
+
+func (t *halfCloseTracker) markLocal() {
+	t.mu.Lock()
+	t.local = true
+	t.finishLocked()
+	t.mu.Unlock()
+}
+
+func (t *halfCloseTracker) markRemote() {
+	t.mu.Lock()
+	t.remote = true
+	t.finishLocked()
+	t.mu.Unlock()
+}
+
+func (t *halfCloseTracker) markStopped() {
+	t.mu.Lock()
+	t.stopped = true
+	t.finishLocked()
+	t.mu.Unlock()
+}
+
+func (t *halfCloseTracker) isStopped() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.stopped
+}
+
 type TCPPortForwarder struct {
 	listen     net.Listener
 	remoteHost string
@@ -130,6 +187,7 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 	errChan chan<- error,
 	conn net.Conn,
 	sessionID, connectionID string,
+	tracker *halfCloseTracker,
 ) {
 	started := false
 	const v3AckBatch = 4
@@ -190,6 +248,7 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 
 			case wspf.MessageTypePortForwardStop:
 				flushAcks()
+				tracker.markStopped()
 				// A stop is the peer's EOF. Flush any body first, then close
 				// the local side so the application sees EOF instead of a
 				// silently stalled tunnel.
@@ -236,6 +295,21 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 					}
 				}
 
+			case "half_close":
+				if p.proto != protoTypePortForwardV3 {
+					continue
+				}
+				flushAcks()
+				if tcpConn, ok := conn.(*net.TCPConn); ok {
+					if err := tcpConn.CloseWrite(); err != nil {
+						fmt.Fprintf(os.Stderr, "error: half-close: %v\n", err)
+						return
+					}
+				} else {
+					return
+				}
+				tracker.markRemote()
+
 			default:
 				fmt.Fprintf(os.Stderr, "error: unrecognized message type %s\n",
 					m.Header.MsgType)
@@ -247,6 +321,23 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 	}
 }
 
+func (p *TCPPortForwarder) sendHalfClose(
+	msgChan chan<- *ws.ProtoMsg,
+	sessionID, connectionID string,
+) {
+	m := &ws.ProtoMsg{
+		Header: ws.ProtoHdr{
+			Proto:     p.proto,
+			MsgType:   "half_close",
+			SessionID: sessionID,
+			Properties: map[string]interface{}{
+				wspf.PropertyConnectionID: connectionID,
+			},
+		},
+	}
+	msgChan <- m
+}
+
 func (p *TCPPortForwarder) handleRequest(
 	ctx context.Context,
 	conn net.Conn,
@@ -256,6 +347,9 @@ func (p *TCPPortForwarder) handleRequest(
 	msgChan chan *ws.ProtoMsg,
 ) {
 	defer conn.Close()
+	connCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	tracker := newHalfCloseTracker()
 
 	window := 1
 	if isFlowControlledPortForward(p.proto) {
@@ -321,15 +415,20 @@ func (p *TCPPortForwarder) handleRequest(
 	}()
 
 	go p.handleDeviceMessages(
-		ctx, msgChan, dataChan,
+		connCtx, msgChan, dataChan,
 		recvChan, errChan, conn,
-		sessionID, connectionID,
+		sessionID, connectionID, tracker,
 	)
 
 	// go routine to handle sent messages
 	for {
 		select {
 		case err := <-errChan:
+			if errors.Is(err, errLocalHalfClose) && p.proto == protoTypePortForwardV3 {
+				p.sendHalfClose(msgChan, sessionID, connectionID)
+				tracker.markLocal()
+				continue
+			}
 			if err != io.EOF {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err.Error())
 			}
@@ -357,6 +456,11 @@ func (p *TCPPortForwarder) handleRequest(
 				Body: data,
 			}
 			msgChan <- m
+		case <-tracker.done:
+			if tracker.isStopped() {
+				sendStopMessage = false
+			}
+			return
 		case <-ctx.Done():
 			return
 		}
@@ -377,7 +481,11 @@ func (p *TCPPortForwarder) handleRequestConnection(
 	for {
 		n, err := conn.Read(data)
 		if err != nil {
-			errChan <- err
+			if p.proto == protoTypePortForwardV3 && errors.Is(err, io.EOF) {
+				errChan <- errLocalHalfClose
+			} else {
+				errChan <- err
+			}
 			break
 		}
 		if n > 0 {

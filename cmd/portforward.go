@@ -456,7 +456,8 @@ func (c *PortForwardCmd) processIncomingMessages(
 				}
 			case wspf.MessageTypePortForward,
 				wspf.MessageTypePortForwardStop,
-				wspf.MessageTypePortForwardNew:
+				wspf.MessageTypePortForwardNew,
+				"half_close":
 				connectionID, _ := m.Header.Properties[wspf.PropertyConnectionID].(string)
 				if connectionID != "" {
 					if recvChan, ok := c.recvChans[connectionID]; ok {
