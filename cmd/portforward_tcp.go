@@ -15,8 +15,8 @@
 package cmd
 
 import (
-	"encoding/binary"
 	"context"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"io"
@@ -24,6 +24,7 @@ import (
 	"os"
 	"strconv"
 	"sync"
+	"time"
 
 	"github.com/mendersoftware/mender-cli/log"
 
@@ -131,8 +132,51 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 	sessionID, connectionID string,
 ) {
 	started := false
+	const v3AckBatch = 4
+	const v3AckDelay = 30 * time.Millisecond
+	pendingAcks := 0
+	var ackTicker *time.Ticker
+	var ackTick <-chan time.Time
+	if p.proto == protoTypePortForwardV3 {
+		ackTicker = time.NewTicker(v3AckDelay)
+		ackTick = ackTicker.C
+		defer ackTicker.Stop()
+	}
+
+	sendAck := func(count int) {
+		if count <= 0 {
+			return
+		}
+		var body []byte
+		if p.proto == protoTypePortForwardV3 {
+			body = make([]byte, 4)
+			binary.BigEndian.PutUint32(body, uint32(count))
+		}
+		m := &ws.ProtoMsg{
+			Header: ws.ProtoHdr{
+				Proto:     p.proto,
+				MsgType:   wspf.MessageTypePortForwardAck,
+				SessionID: sessionID,
+				Properties: map[string]interface{}{
+					wspf.PropertyConnectionID: connectionID,
+				},
+			},
+			Body: body,
+		}
+		msgChan <- m
+	}
+	flushAcks := func() {
+		if pendingAcks == 0 {
+			return
+		}
+		sendAck(pendingAcks)
+		pendingAcks = 0
+	}
+
 	for {
 		select {
+		case <-ackTick:
+			flushAcks()
 		case m := <-recvChan:
 			switch m.Header.MsgType {
 			case wspf.MessageTypePortForwardNew:
@@ -145,6 +189,7 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 				started = true
 
 			case wspf.MessageTypePortForwardStop:
+				flushAcks()
 				// A stop is the peer's EOF. Flush any body first, then close
 				// the local side so the application sees EOF instead of a
 				// silently stalled tunnel.
@@ -162,18 +207,14 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 					}
 				} else if p.proto == ws.ProtoTypePortForward ||
 					isFlowControlledPortForward(p.proto) {
-					// v1 and v2 both use an ACK for flow control.
-					m := &ws.ProtoMsg{
-						Header: ws.ProtoHdr{
-							Proto:     p.proto,
-							MsgType:   wspf.MessageTypePortForwardAck,
-							SessionID: sessionID,
-							Properties: map[string]interface{}{
-								wspf.PropertyConnectionID: connectionID,
-							},
-						},
+					if p.proto == protoTypePortForwardV3 {
+						pendingAcks++
+						if pendingAcks >= v3AckBatch {
+							flushAcks()
+						}
+					} else {
+						sendAck(1)
 					}
-					msgChan <- m
 				}
 
 			case wspf.MessageTypePortForwardAck:
@@ -200,6 +241,7 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 					m.Header.MsgType)
 			}
 		case <-ctx.Done():
+			flushAcks()
 			return
 		}
 	}
