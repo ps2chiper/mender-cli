@@ -62,6 +62,7 @@ type Client struct {
 	url        string
 	skipVerify bool
 	conn       *websocket.Conn
+	readBuffer bytes.Buffer // owned by the reader under readMutex
 	readMutex  *sync.Mutex
 	writeMutex *sync.Mutex
 	token      string
@@ -100,10 +101,13 @@ func (c *Client) Connect(deviceID string, token string) error {
 
 	headers := http.Header{}
 	headers.Set("Authorization", "Bearer "+string(token))
-	websocket.DefaultDialer.TLSClientConfig = &tls.Config{
+	dialer := *websocket.DefaultDialer
+	// Fit the largest negotiated v3 TCP payload and its routing headers in one frame.
+	dialer.WriteBufferSize = 256*1024 + 512
+	dialer.TLSClientConfig = &tls.Config{
 		InsecureSkipVerify: c.skipVerify,
 	}
-	conn, rsp, err := websocket.DefaultDialer.Dial(u.String(), headers)
+	conn, rsp, err := dialer.Dial(u.String(), headers)
 	if err != nil {
 		return errors.Wrap(err, "Unable to connect to the device")
 	}
@@ -178,13 +182,21 @@ func (c *Client) PingPong(ctx context.Context) {
 func (c *Client) ReadMessage() (*ws.ProtoMsg, error) {
 	c.readMutex.Lock()
 	defer c.readMutex.Unlock()
-	_, data, err := c.conn.ReadMessage()
+	_, reader, err := c.conn.NextReader()
 	if err != nil {
+		return nil, err
+	}
+	c.readBuffer.Reset()
+	if _, err = c.readBuffer.ReadFrom(reader); err != nil {
 		return nil, err
 	}
 
 	m := &ws.ProtoMsg{}
-	err = msgpack.Unmarshal(data, m)
+	err = msgpack.Unmarshal(c.readBuffer.Bytes(), m)
+	// bytes.Buffer grows geometrically when reading a framed 256 KiB payload.
+	if c.readBuffer.Cap() > 512*1024 {
+		c.readBuffer = bytes.Buffer{}
+	}
 	if err != nil {
 		return nil, err
 	}

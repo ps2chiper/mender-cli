@@ -100,10 +100,26 @@ func isFlowControlledPortForward(proto ws.ProtoType) bool {
 // flow-control flag. deviceconnect proxies preserve the body untouched, while
 // header properties are metadata and may be dropped by an intermediate proxy.
 type portForwardNewBody struct {
-	RemoteHost  *string                   `msgpack:"remote_host"`
-	RemotePort  *uint16                   `msgpack:"remote_port"`
-	Protocol    *wspf.PortForwardProtocol `msgpack:"protocol"`
-	FlowControl bool                      `msgpack:"flow_control,omitempty"`
+	RemoteHost      *string                   `msgpack:"remote_host"`
+	RemotePort      *uint16                   `msgpack:"remote_port"`
+	Protocol        *wspf.PortForwardProtocol `msgpack:"protocol"`
+	FlowControl     bool                      `msgpack:"flow_control,omitempty"`
+	TCPFrameSize    uint32                    `msgpack:"tcp_frame_size,omitempty"`
+	TCPMaxFrameSize uint32                    `msgpack:"tcp_max_frame_size,omitempty"`
+}
+
+// A mapping may disappear while the WebSocket reader is delivering a reply.
+type forwardInbox struct {
+	messages chan *ws.ProtoMsg
+	done     <-chan struct{}
+}
+
+// The WebSocket writer can exit while a connection worker is still sending.
+func sendForwardMessage(ctx context.Context, out chan<- *ws.ProtoMsg, msg *ws.ProtoMsg) {
+	select {
+	case out <- msg:
+	case <-ctx.Done():
+	}
 }
 
 // PortForwardCmd handles the port-forward command
@@ -116,7 +132,7 @@ type PortForwardCmd struct {
 	sessionID    string
 	bindingHost  string
 	portMappings []portMapping
-	recvChans    map[string]chan *ws.ProtoMsg
+	recvChans    map[string]forwardInbox
 	recvMu       sync.RWMutex
 	running      bool
 	stop         chan struct{}
@@ -207,7 +223,7 @@ func NewPortForwardCmd(cmd *cobra.Command, args []string) (*PortForwardCmd, erro
 		deviceID:     args[0],
 		bindingHost:  bindingHost,
 		portMappings: portMappings,
-		recvChans:    make(map[string]chan *ws.ProtoMsg),
+		recvChans:    make(map[string]forwardInbox),
 		stop:         make(chan struct{}),
 	}, nil
 }
@@ -409,8 +425,28 @@ func (c *PortForwardCmd) deliver(connectionID string, message *ws.ProtoMsg) {
 	recvChan, ok := c.recvChans[connectionID]
 	c.recvMu.RUnlock()
 	if ok {
-		recvChan <- message
+		select {
+		case recvChan.messages <- message:
+		case <-recvChan.done:
+		}
 	}
+}
+
+func (c *PortForwardCmd) handleForwardError(m *ws.ProtoMsg) error {
+	id, _ := m.Header.Properties[wspf.PropertyConnectionID].(string)
+	var detail wspf.Error
+	if err := msgpack.Unmarshal(m.Body, &detail); err != nil || detail.Error == nil {
+		return fmt.Errorf("invalid port-forward error for connection %q", id)
+	}
+	if detail.MessageType != nil {
+		log.Err(fmt.Sprintf("port-forward connection %q (%q): %q", id, *detail.MessageType, *detail.Error))
+	} else {
+		log.Err(fmt.Sprintf("port-forward connection %q: %q", id, *detail.Error))
+	}
+	if id != "" && detail.MessageType != nil && *detail.MessageType == wspf.MessageTypePortForwardNew {
+		c.deliver(id, m)
+	}
+	return nil
 }
 
 func (c *PortForwardCmd) processIncomingMessages(
@@ -445,13 +481,9 @@ func (c *PortForwardCmd) processIncomingMessages(
 		case c.proto, ws.ProtoTypePortForwardV2:
 			switch m.Header.MsgType {
 			case wspf.MessageTypeError:
-				erro := new(ws.Error)
-				if err := msgpack.Unmarshal(m.Body, erro); err != nil &&
-					erro.MessageType != wspf.MessageTypePortForwardStop {
-					c.err = errors.New(fmt.Sprintf(
-						"Unable to start the port-forwarding: %s",
-						string(m.Body),
-					))
+				if err := c.handleForwardError(m); err != nil {
+					c.err = err
+					log.Err(err.Error())
 					c.running = false
 					c.Stop()
 				}

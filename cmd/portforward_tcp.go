@@ -38,9 +38,13 @@ import (
 const (
 	portForwardTCPChannelSize = 20
 	portForwardTCPWindow      = 8
+	// Leave room for ACKs and control frames in Deviceconnect's 25-message channel.
+	portForwardV3TCPWindow = 16
 	// v2 TCP frames are larger than the v1 4 KiB chunk. The Rust daemon
 	// accepts the matching limit for an opted-in v2 connection.
-	portForwardTCPReadBuffer = 7680
+	portForwardTCPReadBuffer  = 7680
+	portForwardV3FrameSize    = 32 * 1024
+	portForwardV3MaxFrameSize = 256 * 1024
 )
 
 // errLocalHalfClose tells handleRequest that the client has finished sending
@@ -94,19 +98,12 @@ func (t *halfCloseTracker) markStopped() {
 	t.mu.Unlock()
 }
 
-func (t *halfCloseTracker) isStopped() bool {
-	t.mu.Lock()
-	defer t.mu.Unlock()
-	return t.stopped
-}
-
 type TCPPortForwarder struct {
 	listen     net.Listener
 	remoteHost string
 	remotePort uint16
-	ackCredits map[string]chan struct{}
-	ackMu      sync.RWMutex
-	proto      ws.ProtoType
+
+	proto ws.ProtoType
 }
 
 func NewTCPPortForwarder(
@@ -125,7 +122,6 @@ func NewTCPPortForwarder(
 		listen:     listen,
 		remoteHost: remoteHost,
 		remotePort: remotePort,
-		ackCredits: map[string]chan struct{}{},
 		proto:      proto,
 	}, nil
 }
@@ -134,7 +130,7 @@ func (p *TCPPortForwarder) Run(
 	ctx context.Context,
 	sessionID string,
 	msgChan chan *ws.ProtoMsg,
-	recvChans map[string]chan *ws.ProtoMsg,
+	recvChans map[string]forwardInbox,
 	recvMu *sync.RWMutex,
 ) {
 	// listen for new connections
@@ -153,7 +149,12 @@ func (p *TCPPortForwarder) Run(
 				conn.RemoteAddr().String(),
 				conn.LocalAddr().String(),
 			)
-			acceptedConnections <- conn
+			select {
+			case acceptedConnections <- conn:
+			case <-ctx.Done():
+				conn.Close()
+				return
+			}
 		}
 	}()
 
@@ -171,13 +172,44 @@ func (p *TCPPortForwarder) Run(
 				connectionID += ":flow"
 			}
 			recvChan := make(chan *ws.ProtoMsg, portForwardTCPChannelSize)
+			connCtx, cancel := context.WithCancel(ctx)
 			recvMu.Lock()
-			recvChans[connectionID] = recvChan
+			recvChans[connectionID] = forwardInbox{recvChan, connCtx.Done()}
 			recvMu.Unlock()
-			go p.handleRequest(ctx, conn, sessionID, connectionID, recvChan, msgChan)
+			go func() {
+				defer func() {
+					cancel()
+					recvMu.Lock()
+					delete(recvChans, connectionID)
+					recvMu.Unlock()
+				}()
+				p.handleRequest(connCtx, conn, sessionID, connectionID, recvChan, msgChan)
+			}()
 		case <-ctx.Done():
 			return
 		}
+	}
+}
+
+// A v3 peer confirms larger frames in its new reply. Earlier peers reply
+// with an empty body. Bound outstanding data to 4 MiB for negotiated frames.
+func tcpFlowLimits(proto ws.ProtoType, body []byte) (frameSize, window int) {
+	switch proto {
+	case protoTypePortForwardV3:
+		var accept struct {
+			TCPFrameSize uint32 `msgpack:"tcp_frame_size"`
+		}
+		if len(body) > 0 && msgpack.Unmarshal(body, &accept) == nil {
+			switch accept.TCPFrameSize {
+			case portForwardV3MaxFrameSize, portForwardV3FrameSize:
+				return int(accept.TCPFrameSize), portForwardV3TCPWindow
+			}
+		}
+		return portForwardTCPReadBuffer, portForwardV3TCPWindow
+	case ws.ProtoTypePortForwardV2:
+		return portForwardTCPReadBuffer, portForwardTCPWindow
+	default:
+		return readBuffLength, 1
 	}
 }
 
@@ -192,7 +224,7 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 	sessionID, connectionID string,
 	tracker *halfCloseTracker,
 ) {
-	started := false
+	var credits chan struct{}
 	const v3AckBatch = 4
 	const v3AckDelay = 30 * time.Millisecond
 	pendingAcks := 0
@@ -224,7 +256,7 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 			},
 			Body: body,
 		}
-		msgChan <- m
+		sendForwardMessage(ctx, msgChan, m)
 	}
 	flushAcks := func() {
 		if pendingAcks == 0 {
@@ -241,23 +273,29 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 		case m := <-recvChan:
 			switch m.Header.MsgType {
 			case wspf.MessageTypePortForwardNew:
-				if started {
+				if credits != nil {
 					log.Err("duplicate new response received, discarding")
 					continue
 				}
-				// go routine to handle the network connection
-				go p.handleRequestConnection(dataChan, errChan, conn)
-				started = true
+				readSize, window := tcpFlowLimits(p.proto, m.Body)
+				credits = make(chan struct{}, window)
+				for i := 0; i < window; i++ {
+					credits <- struct{}{}
+				}
+				go p.handleRequestConnection(ctx, dataChan, errChan, conn, readSize, credits)
 
-			case wspf.MessageTypePortForwardStop:
-				flushAcks()
+			case wspf.MessageTypeError:
+				// The device rejected the new request. It owns no socket to stop.
 				tracker.markStopped()
+				return
+			case wspf.MessageTypePortForwardStop:
 				// A stop is the peer's EOF. Flush any body first, then close
 				// the local side so the application sees EOF instead of a
 				// silently stalled tunnel.
 				if len(m.Body) != 0 {
 					_, _ = conn.Write(m.Body)
 				}
+				tracker.markStopped()
 				_ = conn.Close()
 				return
 
@@ -284,17 +322,12 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 				// of credits released. v1/v2 use one credit.
 				count := 1
 				if p.proto == protoTypePortForwardV3 && len(m.Body) >= 4 {
-					count = int(binary.BigEndian.Uint32(m.Body[:4]))
+					count = int(min(binary.BigEndian.Uint32(m.Body[:4]), uint32(portForwardV3TCPWindow)))
 				}
-				p.ackMu.RLock()
-				credits, ok := p.ackCredits[connectionID]
-				p.ackMu.RUnlock()
-				if ok {
-					for i := 0; i < count; i++ {
-						select {
-						case credits <- struct{}{}:
-						default:
-						}
+				for i := 0; i < min(count, cap(credits)); i++ {
+					select {
+					case credits <- struct{}{}:
+					default:
 					}
 				}
 
@@ -318,13 +351,13 @@ func (p *TCPPortForwarder) handleDeviceMessages(
 					m.Header.MsgType)
 			}
 		case <-ctx.Done():
-			flushAcks()
 			return
 		}
 	}
 }
 
 func (p *TCPPortForwarder) sendHalfClose(
+	ctx context.Context,
 	msgChan chan<- *ws.ProtoMsg,
 	sessionID, connectionID string,
 ) {
@@ -338,7 +371,7 @@ func (p *TCPPortForwarder) sendHalfClose(
 			},
 		},
 	}
-	msgChan <- m
+	sendForwardMessage(ctx, msgChan, m)
 }
 
 func (p *TCPPortForwarder) handleRequest(
@@ -354,23 +387,6 @@ func (p *TCPPortForwarder) handleRequest(
 	defer cancel()
 	tracker := newHalfCloseTracker()
 
-	window := 1
-	if isFlowControlledPortForward(p.proto) {
-		window = portForwardTCPWindow
-	}
-	credits := make(chan struct{}, window)
-	for i := 0; i < window; i++ {
-		credits <- struct{}{}
-	}
-	p.ackMu.Lock()
-	p.ackCredits[connectionID] = credits
-	p.ackMu.Unlock()
-	defer func() {
-		p.ackMu.Lock()
-		delete(p.ackCredits, connectionID)
-		p.ackMu.Unlock()
-	}()
-
 	errChan := make(chan error)
 	dataChan := make(chan []byte)
 
@@ -380,6 +396,10 @@ func (p *TCPPortForwarder) handleRequest(
 		RemoteHost:  &p.remoteHost,
 		RemotePort:  &p.remotePort,
 		FlowControl: isFlowControlledPortForward(p.proto),
+	}
+	if p.proto == protoTypePortForwardV3 {
+		portforwardNew.TCPFrameSize = portForwardV3FrameSize
+		portforwardNew.TCPMaxFrameSize = portForwardV3MaxFrameSize
 	}
 	body, err := msgpack.Marshal(portforwardNew)
 	if err != nil {
@@ -397,24 +417,27 @@ func (p *TCPPortForwarder) handleRequest(
 		},
 		Body: body,
 	}
-	msgChan <- m
+	sendForwardMessage(ctx, msgChan, m)
 
-	sendStopMessage := true
 	defer func() {
 		conn.Close()
-		if sendStopMessage {
-			m := &ws.ProtoMsg{
-				Header: ws.ProtoHdr{
-					Proto:     p.proto,
-					MsgType:   wspf.MessageTypePortForwardStop,
-					SessionID: sessionID,
-					Properties: map[string]interface{}{
-						wspf.PropertyConnectionID: connectionID,
-					},
-				},
-			}
-			msgChan <- m
+		// The peer retires the flow after a stop or both v3 half-closes.
+		select {
+		case <-tracker.done:
+			return
+		default:
 		}
+		m := &ws.ProtoMsg{
+			Header: ws.ProtoHdr{
+				Proto:     p.proto,
+				MsgType:   wspf.MessageTypePortForwardStop,
+				SessionID: sessionID,
+				Properties: map[string]interface{}{
+					wspf.PropertyConnectionID: connectionID,
+				},
+			},
+		}
+		sendForwardMessage(ctx, msgChan, m)
 	}()
 
 	go p.handleDeviceMessages(
@@ -428,7 +451,7 @@ func (p *TCPPortForwarder) handleRequest(
 		select {
 		case err := <-errChan:
 			if errors.Is(err, errLocalHalfClose) && p.proto == protoTypePortForwardV3 {
-				p.sendHalfClose(msgChan, sessionID, connectionID)
+				p.sendHalfClose(connCtx, msgChan, sessionID, connectionID)
 				tracker.markLocal()
 				continue
 			}
@@ -437,15 +460,6 @@ func (p *TCPPortForwarder) handleRequest(
 			}
 			return
 		case data := <-dataChan:
-			p.ackMu.RLock()
-			credits, ok := p.ackCredits[connectionID]
-			p.ackMu.RUnlock()
-			if ok {
-				// Acquire a bounded window slot. v1 uses one slot; v2
-				// uses a wider window so the WAN round trip is not paid
-				// for every 4 KiB frame.
-				<-credits
-			}
 
 			m := &ws.ProtoMsg{
 				Header: ws.ProtoHdr{
@@ -458,11 +472,8 @@ func (p *TCPPortForwarder) handleRequest(
 				},
 				Body: data,
 			}
-			msgChan <- m
+			sendForwardMessage(ctx, msgChan, m)
 		case <-tracker.done:
-			if tracker.isStopped() {
-				sendStopMessage = false
-			}
 			return
 		case <-ctx.Done():
 			return
@@ -471,30 +482,40 @@ func (p *TCPPortForwarder) handleRequest(
 }
 
 func (p *TCPPortForwarder) handleRequestConnection(
+	ctx context.Context,
 	dataChan chan<- []byte,
 	errChan chan<- error,
 	conn net.Conn,
+	readLength int,
+	credits <-chan struct{},
 ) {
-	readLength := readBuffLength
-	if isFlowControlledPortForward(p.proto) {
-		readLength = portForwardTCPReadBuffer
-	}
 	data := make([]byte, readLength)
 
 	for {
 		n, err := conn.Read(data)
 		if err != nil {
 			if p.proto == protoTypePortForwardV3 && errors.Is(err, io.EOF) {
-				errChan <- errLocalHalfClose
-			} else {
-				errChan <- err
+				err = errLocalHalfClose
 			}
-			break
+			select {
+			case errChan <- err:
+			case <-ctx.Done():
+			}
+			return
 		}
 		if n > 0 {
+			select {
+			case <-credits:
+			case <-ctx.Done():
+				return
+			}
 			tmp := make([]byte, n)
 			copy(tmp, data[:n])
-			dataChan <- tmp
+			select {
+			case dataChan <- tmp:
+			case <-ctx.Done():
+				return
+			}
 		}
 	}
 }
