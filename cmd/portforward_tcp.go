@@ -135,6 +135,7 @@ func (p *TCPPortForwarder) Run(
 	sessionID string,
 	msgChan chan *ws.ProtoMsg,
 	recvChans map[string]chan *ws.ProtoMsg,
+	recvMu *sync.RWMutex,
 ) {
 	// listen for new connections
 	defer p.listen.Close()
@@ -170,7 +171,9 @@ func (p *TCPPortForwarder) Run(
 				connectionID += ":flow"
 			}
 			recvChan := make(chan *ws.ProtoMsg, portForwardTCPChannelSize)
+			recvMu.Lock()
 			recvChans[connectionID] = recvChan
+			recvMu.Unlock()
 			go p.handleRequest(ctx, conn, sessionID, connectionID, recvChan, msgChan)
 		case <-ctx.Done():
 			return

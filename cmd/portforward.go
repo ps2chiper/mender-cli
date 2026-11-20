@@ -22,6 +22,7 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/mendersoftware/go-lib-micro/ws"
@@ -116,6 +117,7 @@ type PortForwardCmd struct {
 	bindingHost  string
 	portMappings []portMapping
 	recvChans    map[string]chan *ws.ProtoMsg
+	recvMu       sync.RWMutex
 	running      bool
 	stop         chan struct{}
 	err          error
@@ -260,7 +262,7 @@ func (c *PortForwardCmd) run() error {
 			if err != nil {
 				return err
 			}
-			go forwarder.Run(ctx, c.sessionID, msgChan, c.recvChans)
+			go forwarder.Run(ctx, c.sessionID, msgChan, c.recvChans, &c.recvMu)
 		case protocolUDP:
 			udpProto := c.proto
 			if udpProto == protoTypePortForwardV3 {
@@ -273,7 +275,7 @@ func (c *PortForwardCmd) run() error {
 			if err != nil {
 				return err
 			}
-			go forwarder.Run(ctx, c.sessionID, msgChan, c.recvChans)
+			go forwarder.Run(ctx, c.sessionID, msgChan, c.recvChans, &c.recvMu)
 		default:
 			return errors.New("unknown protocol: " + portMapping.Protocol)
 		}
@@ -402,6 +404,15 @@ func (c *PortForwardCmd) closeSession(client *deviceconnect.Client) error {
 	return nil
 }
 
+func (c *PortForwardCmd) deliver(connectionID string, message *ws.ProtoMsg) {
+	c.recvMu.RLock()
+	recvChan, ok := c.recvChans[connectionID]
+	c.recvMu.RUnlock()
+	if ok {
+		recvChan <- message
+	}
+}
+
 func (c *PortForwardCmd) processIncomingMessages(
 	msgChan chan *ws.ProtoMsg,
 	client *deviceconnect.Client,
@@ -450,9 +461,7 @@ func (c *PortForwardCmd) processIncomingMessages(
 				// connection so the sender can release one credit.
 				connectionID, _ := m.Header.Properties[wspf.PropertyConnectionID].(string)
 				if connectionID != "" {
-					if recvChan, ok := c.recvChans[connectionID]; ok {
-						recvChan <- m
-					}
+					c.deliver(connectionID, m)
 				}
 			case wspf.MessageTypePortForward,
 				wspf.MessageTypePortForwardStop,
@@ -460,9 +469,7 @@ func (c *PortForwardCmd) processIncomingMessages(
 				"half_close":
 				connectionID, _ := m.Header.Properties[wspf.PropertyConnectionID].(string)
 				if connectionID != "" {
-					if recvChan, ok := c.recvChans[connectionID]; ok {
-						recvChan <- m
-					}
+					c.deliver(connectionID, m)
 				}
 
 			default:

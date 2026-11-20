@@ -15,14 +15,14 @@
 package cmd
 
 import (
-	"encoding/binary"
 	"context"
 	"fmt"
-	"io"
 	"net"
 	"os"
 	"strconv"
 	"sync"
+	"sync/atomic"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/mendersoftware/go-lib-micro/ws"
@@ -33,17 +33,42 @@ import (
 
 const (
 	portForwardUDPChannelSize = 20
+	portForwardUDPQueueSize   = 256
 	portForwardUDPWindow      = 3
+	portForwardUDPMaxFlows    = 64
+	portForwardUDPIdle        = 30 * time.Second
+	portForwardUDPSweep       = 5 * time.Second
 )
 
+// UDPPortForwarder owns one local UDP listener and creates an independent
+// Mender port-forward connection for each observed local UDP source. The
+// daemon then gives each source its own connected target socket, so responses
+// cannot be misrouted between clients. This is the useful part of chisel's
+// per-source UDP flow table, expressed with Mender connection IDs.
 type UDPPortForwarder struct {
 	conn       *net.UDPConn
 	remoteHost string
 	remotePort uint16
-	sourceAddr *net.UDPAddr
-	sourceMu   sync.RWMutex
-	ackCredits chan struct{}
 	proto      ws.ProtoType
+	flowProto  ws.ProtoType
+	sessionID  string
+	msgChan    chan *ws.ProtoMsg
+	recvChans  map[string]chan *ws.ProtoMsg
+	recvMu     *sync.RWMutex
+
+	mu    sync.Mutex
+	flows map[string]*udpFlow
+}
+
+type udpFlow struct {
+	p            *UDPPortForwarder
+	source       *net.UDPAddr
+	connectionID string
+	recvChan     chan *ws.ProtoMsg
+	sendChan     chan []byte
+	credits      chan struct{}
+	lastSeen     atomic.Int64
+	closed       atomic.Bool
 }
 
 func NewUDPPortForwarder(
@@ -68,16 +93,21 @@ func NewUDPPortForwarder(
 	if err != nil {
 		return nil, err
 	}
-	// A local UDP sender can burst far faster than the WebSocket credit
-	// window drains. Keep the kernel receive queue from truncating an
-	// otherwise deliverable burst.
 	_ = conn.SetReadBuffer(4 * 1024 * 1024)
 	_ = conn.SetWriteBuffer(4 * 1024 * 1024)
+	flowProto := proto
+	if flowProto == protoTypePortForwardV3 {
+		// v3 UDP source fan-out uses the stable v2 datagram transport; each
+		// source has a separate connection and target socket.
+		flowProto = ws.ProtoTypePortForwardV2
+	}
 	return &UDPPortForwarder{
 		proto:      proto,
+		flowProto:  flowProto,
 		conn:       conn,
 		remoteHost: remoteHost,
 		remotePort: remotePort,
+		flows:      make(map[string]*udpFlow),
 	}, nil
 }
 
@@ -86,180 +116,268 @@ func (p *UDPPortForwarder) Run(
 	sessionID string,
 	msgChan chan *ws.ProtoMsg,
 	recvChans map[string]chan *ws.ProtoMsg,
+	recvMu *sync.RWMutex,
 ) {
-	// listen for new connections
 	defer p.conn.Close()
+	p.sessionID = sessionID
+	p.msgChan = msgChan
+	p.recvChans = recvChans
+	p.recvMu = recvMu
 
+	go p.cleanup(ctx)
+	p.readLoop(ctx)
+	p.closeAll()
+}
+
+func (p *UDPPortForwarder) readLoop(ctx context.Context) {
+	buffer := make([]byte, readBuffLength)
+	for {
+		_ = p.conn.SetReadDeadline(time.Now().Add(time.Second))
+		n, source, err := p.conn.ReadFromUDP(buffer)
+		if err != nil {
+			if ne, ok := err.(net.Error); ok && ne.Timeout() {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+					continue
+				}
+			}
+			select {
+			case <-ctx.Done():
+			default:
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			}
+			return
+		}
+		if n == 0 {
+			continue
+		}
+		flow := p.flowFor(ctx, source)
+		if flow == nil {
+			continue
+		}
+		data := make([]byte, n)
+		copy(data, buffer[:n])
+		select {
+		case flow.sendChan <- data:
+			flow.lastSeen.Store(time.Now().UnixNano())
+		default:
+			// This source's bounded queue is full; UDP remains best effort.
+		}
+	}
+}
+
+func (p *UDPPortForwarder) flowFor(ctx context.Context, source *net.UDPAddr) *udpFlow {
+	key := source.String()
+	p.mu.Lock()
+	if flow, ok := p.flows[key]; ok {
+		p.mu.Unlock()
+		return flow
+	}
+	if len(p.flows) >= portForwardUDPMaxFlows {
+		p.mu.Unlock()
+		return nil
+	}
 	connectionUUID, _ := uuid.NewUUID()
 	connectionID := connectionUUID.String()
-	if isFlowControlledPortForward(p.proto) {
+	if isFlowControlledPortForward(p.flowProto) {
 		connectionID += ":flow"
 	}
-	recvChan := make(chan *ws.ProtoMsg, portForwardUDPChannelSize)
-	recvChans[connectionID] = recvChan
 	window := 1
-	if isFlowControlledPortForward(p.proto) {
+	if isFlowControlledPortForward(p.flowProto) {
 		window = portForwardUDPWindow
 	}
-	p.ackCredits = make(chan struct{}, window)
-	for i := 0; i < window; i++ {
-		p.ackCredits <- struct{}{}
+	flow := &udpFlow{
+		p:            p,
+		source:       source,
+		connectionID: connectionID,
+		recvChan:     make(chan *ws.ProtoMsg, portForwardUDPChannelSize),
+		sendChan:     make(chan []byte, portForwardUDPQueueSize),
+		credits:      make(chan struct{}, window),
 	}
+	for i := 0; i < window; i++ {
+		flow.credits <- struct{}{}
+	}
+	flow.lastSeen.Store(time.Now().UnixNano())
+	p.flows[key] = flow
+	p.mu.Unlock()
 
+	p.recvMu.Lock()
+	p.recvChans[connectionID] = flow.recvChan
+	p.recvMu.Unlock()
+
+	go flow.run(ctx)
+	go flow.sendLoop(ctx)
+	p.sendNew(flow)
+	return flow
+}
+
+func (p *UDPPortForwarder) sendNew(flow *udpFlow) {
 	protocol := portforward.PortForwardProtocol(wspf.PortForwardProtocolUDP)
-	portforwardNew := &portForwardNewBody{
+	body, err := msgpack.Marshal(&portForwardNewBody{
 		Protocol:    &protocol,
 		RemoteHost:  &p.remoteHost,
 		RemotePort:  &p.remotePort,
-		FlowControl: isFlowControlledPortForward(p.proto),
-	}
-	body, err := msgpack.Marshal(portforwardNew)
+		FlowControl: isFlowControlledPortForward(p.flowProto),
+	})
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: %v\n", err.Error())
-		panic(err)
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
+		return
 	}
-	m := &ws.ProtoMsg{
+	p.msgChan <- &ws.ProtoMsg{
 		Header: ws.ProtoHdr{
-			Proto:     p.proto,
+			Proto:     p.flowProto,
 			MsgType:   wspf.MessageTypePortForwardNew,
-			SessionID: sessionID,
+			SessionID: p.sessionID,
 			Properties: map[string]interface{}{
-				wspf.PropertyConnectionID: connectionID,
+				wspf.PropertyConnectionID: flow.connectionID,
 			},
 		},
 		Body: body,
 	}
-	msgChan <- m
+}
 
-	sendStopMessage := true
-	defer func() {
-		if sendStopMessage {
-			m := &ws.ProtoMsg{
-				Header: ws.ProtoHdr{
-					Proto:     p.proto,
-					MsgType:   wspf.MessageTypePortForwardStop,
-					SessionID: sessionID,
-					Properties: map[string]interface{}{
-						wspf.PropertyConnectionID: connectionID,
-					},
-				},
-			}
-			msgChan <- m
-		}
-	}()
-
-	errChan := make(chan error)
-	dataChan := make(chan []byte)
-
-	// go routine to handle the network connection
-	go p.handleRequestConnection(dataChan, errChan)
-
-	// go routine to handle received messages
-	go func() {
-		for {
-			select {
-			case m := <-recvChan:
-				if m.Header.Proto == p.proto &&
-					m.Header.MsgType == wspf.MessageTypePortForwardStop {
-					sendStopMessage = false
-					return
-				} else if m.Header.Proto == p.proto &&
-					m.Header.MsgType == wspf.MessageTypePortForward {
-					p.sourceMu.RLock()
-					sourceAddr := p.sourceAddr
-					p.sourceMu.RUnlock()
-					if sourceAddr == nil {
-						continue
-					}
-					_, err := p.conn.WriteToUDP(m.Body, sourceAddr)
-					if err != nil {
-						fmt.Fprintf(os.Stderr, "error: %v\n", err.Error())
-					} else if p.proto == ws.ProtoTypePortForward ||
-						p.proto == ws.ProtoTypePortForwardV2 {
-						// send the ack (v1 and flow-controlled v2)
-						m := &ws.ProtoMsg{
-							Header: ws.ProtoHdr{
-								Proto:     p.proto,
-								MsgType:   wspf.MessageTypePortForwardAck,
-								SessionID: sessionID,
-								Properties: map[string]interface{}{
-									wspf.PropertyConnectionID: connectionID,
-								},
-							},
-						}
-						msgChan <- m
-					}
-				} else if (m.Header.Proto == ws.ProtoTypePortForward ||
-					m.Header.Proto == ws.ProtoTypePortForwardV2 ||
-					m.Header.Proto == protoTypePortForwardV3) &&
-					m.Header.MsgType == wspf.MessageTypePortForwardAck {
-					count := 1
-					if m.Header.Proto == protoTypePortForwardV3 && len(m.Body) >= 4 {
-						count = int(binary.BigEndian.Uint32(m.Body[:4]))
-					}
-					for i := 0; i < count; i++ {
-						select {
-						case p.ackCredits <- struct{}{}:
-						default:
-						}
-					}
-				}
-			case <-ctx.Done():
-				return
-			}
-		}
-	}()
-
-	// go routine to handle sent messages
+func (f *udpFlow) run(ctx context.Context) {
+	defer f.p.removeFlow(f)
 	for {
 		select {
-		case err := <-errChan:
-			if err != io.EOF {
-				fmt.Fprintf(os.Stderr, "error: %v\n", err.Error())
+		case m := <-f.recvChan:
+			switch m.Header.MsgType {
+			case wspf.MessageTypePortForwardNew:
+				continue
+			case wspf.MessageTypePortForward:
+				if _, err := f.p.conn.WriteToUDP(m.Body, f.source); err != nil {
+					fmt.Fprintf(os.Stderr, "error: %v\n", err)
+					continue
+				}
+				f.lastSeen.Store(time.Now().UnixNano())
+				if f.p.flowProto == ws.ProtoTypePortForward ||
+					isFlowControlledPortForward(f.p.flowProto) {
+					f.p.msgChan <- &ws.ProtoMsg{
+						Header: ws.ProtoHdr{
+							Proto:     f.p.flowProto,
+							MsgType:   wspf.MessageTypePortForwardAck,
+							SessionID: f.p.sessionID,
+							Properties: map[string]interface{}{
+								wspf.PropertyConnectionID: f.connectionID,
+							},
+						},
+					}
+				}
+			case wspf.MessageTypePortForwardAck:
+				select {
+				case f.credits <- struct{}{}:
+				default:
+				}
+			case wspf.MessageTypePortForwardStop:
+				f.close(false)
+				return
+			case wspf.MessageTypeError:
+				fmt.Fprintf(os.Stderr, "port-forward UDP flow error: %s\n", string(m.Body))
+				f.close(false)
+				return
+			default:
+				continue
 			}
-			return
-		case data := <-dataChan:
-			if p.proto == ws.ProtoTypePortForward ||
-				isFlowControlledPortForward(p.proto) {
-				// Acquire a bounded window slot. v1 uses one slot;
-				// v2 can keep up to 3 datagrams in flight.
-				<-p.ackCredits
-			}
-
-			m := &ws.ProtoMsg{
-				Header: ws.ProtoHdr{
-					Proto:     p.proto,
-					MsgType:   wspf.MessageTypePortForward,
-					SessionID: sessionID,
-					Properties: map[string]interface{}{
-						wspf.PropertyConnectionID: connectionID,
-					},
-				},
-				Body: data,
-			}
-			msgChan <- m
 		case <-ctx.Done():
 			return
 		}
 	}
 }
 
-func (p *UDPPortForwarder) handleRequestConnection(dataChan chan []byte, errChan chan error) {
-	data := make([]byte, readBuffLength)
-
+func (f *udpFlow) sendLoop(ctx context.Context) {
 	for {
-		n, udpAddr, err := p.conn.ReadFromUDP(data[:])
-		if err != nil {
-			errChan <- err
-			break
+		select {
+		case data := <-f.sendChan:
+			select {
+			case <-f.credits:
+			case <-ctx.Done():
+				return
+			}
+			if f.closed.Load() {
+				continue
+			}
+			f.lastSeen.Store(time.Now().UnixNano())
+			f.p.msgChan <- &ws.ProtoMsg{
+				Header: ws.ProtoHdr{
+					Proto:     f.p.flowProto,
+					MsgType:   wspf.MessageTypePortForward,
+					SessionID: f.p.sessionID,
+					Properties: map[string]interface{}{
+						wspf.PropertyConnectionID: f.connectionID,
+					},
+				},
+				Body: data,
+			}
+		case <-ctx.Done():
+			return
 		}
-		if n > 0 {
-			p.sourceMu.Lock()
-			p.sourceAddr = udpAddr
-			p.sourceMu.Unlock()
-			tmp := make([]byte, n)
-			copy(tmp, data[:n])
-			dataChan <- tmp
+	}
+}
+
+func (f *udpFlow) close(sendStop bool) {
+	if !f.closed.CompareAndSwap(false, true) {
+		return
+	}
+	f.p.removeFlow(f)
+	if sendStop {
+		f.p.msgChan <- &ws.ProtoMsg{
+			Header: ws.ProtoHdr{
+				Proto:     f.p.flowProto,
+				MsgType:   wspf.MessageTypePortForwardStop,
+				SessionID: f.p.sessionID,
+				Properties: map[string]interface{}{
+					wspf.PropertyConnectionID: f.connectionID,
+				},
+			},
 		}
+	}
+}
+
+func (p *UDPPortForwarder) removeFlow(flow *udpFlow) {
+	p.recvMu.Lock()
+	delete(p.recvChans, flow.connectionID)
+	p.recvMu.Unlock()
+	p.mu.Lock()
+	if p.flows[flow.source.String()] == flow {
+		delete(p.flows, flow.source.String())
+	}
+	p.mu.Unlock()
+}
+
+func (p *UDPPortForwarder) cleanup(ctx context.Context) {
+	ticker := time.NewTicker(portForwardUDPSweep)
+	defer ticker.Stop()
+	for {
+		select {
+		case now := <-ticker.C:
+			cutoff := now.Add(-portForwardUDPIdle).UnixNano()
+			p.mu.Lock()
+			expired := make([]*udpFlow, 0)
+			for _, flow := range p.flows {
+				if flow.lastSeen.Load() < cutoff {
+					expired = append(expired, flow)
+				}
+			}
+			p.mu.Unlock()
+			for _, flow := range expired {
+				flow.close(true)
+			}
+		case <-ctx.Done():
+			return
+		}
+	}
+}
+
+func (p *UDPPortForwarder) closeAll() {
+	p.mu.Lock()
+	flows := make([]*udpFlow, 0, len(p.flows))
+	for _, flow := range p.flows {
+		flows = append(flows, flow)
+	}
+	p.mu.Unlock()
+	for _, flow := range flows {
+		flow.close(true)
 	}
 }
