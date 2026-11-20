@@ -111,8 +111,9 @@ type portForwardNewBody struct {
 
 // A mapping may disappear while the WebSocket reader is delivering a reply.
 type forwardInbox struct {
-	messages chan *ws.ProtoMsg
-	done     <-chan struct{}
+	messages      chan *ws.ProtoMsg
+	done          <-chan struct{}
+	forwardErrors bool
 }
 
 // The WebSocket writer can exit while a connection worker is still sending.
@@ -429,10 +430,14 @@ func (c *PortForwardCmd) deliver(connectionID string, message *ws.ProtoMsg) {
 	recvChan, ok := c.recvChans[connectionID]
 	c.recvMu.RUnlock()
 	if ok {
-		select {
-		case recvChan.messages <- message:
-		case <-recvChan.done:
-		}
+		recvChan.deliver(message)
+	}
+}
+
+func (inbox forwardInbox) deliver(message *ws.ProtoMsg) {
+	select {
+	case inbox.messages <- message:
+	case <-inbox.done:
 	}
 }
 
@@ -447,8 +452,18 @@ func (c *PortForwardCmd) handleForwardError(m *ws.ProtoMsg) error {
 	} else {
 		log.Err(fmt.Sprintf("port-forward connection %q: %q", id, *detail.Error))
 	}
-	if id != "" && detail.MessageType != nil && *detail.MessageType == wspf.MessageTypePortForwardNew {
-		c.deliver(id, m)
+	if id != "" && detail.MessageType != nil {
+		switch *detail.MessageType {
+		case wspf.MessageTypePortForwardNew:
+			c.deliver(id, m)
+		case wspf.MessageTypePortForward:
+			c.recvMu.RLock()
+			inbox := c.recvChans[id]
+			c.recvMu.RUnlock()
+			if inbox.forwardErrors {
+				inbox.deliver(m)
+			}
+		}
 	}
 	return nil
 }

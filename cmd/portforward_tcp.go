@@ -174,7 +174,7 @@ func (p *TCPPortForwarder) Run(
 			recvChan := make(chan *ws.ProtoMsg, portForwardTCPChannelSize)
 			connCtx, cancel := context.WithCancel(ctx)
 			recvMu.Lock()
-			recvChans[connectionID] = forwardInbox{recvChan, connCtx.Done()}
+			recvChans[connectionID] = forwardInbox{messages: recvChan, done: connCtx.Done()}
 			recvMu.Unlock()
 			go func() {
 				defer func() {

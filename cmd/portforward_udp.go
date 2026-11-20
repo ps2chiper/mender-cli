@@ -222,10 +222,10 @@ func (p *UDPPortForwarder) flowFor(ctx context.Context, source *net.UDPAddr) *ud
 	}
 	flow.lastSeen.Store(time.Now().UnixNano())
 	p.flows[key] = flow
-	p.recvChans[connectionID] = forwardInbox{flow.recvChan, flowCtx.Done()}
+	p.recvChans[connectionID] = forwardInbox{messages: flow.recvChan, done: flowCtx.Done(), forwardErrors: p.flowProto == protoTypePortForwardV3}
 	p.recvMu.Unlock()
 
-	go flow.run(flowCtx)
+	go flow.run(ctx, flowCtx)
 	p.sendNew(flowCtx, flow)
 	return flow
 }
@@ -256,7 +256,7 @@ func (p *UDPPortForwarder) sendNew(ctx context.Context, flow *udpFlow) {
 	})
 }
 
-func (f *udpFlow) run(ctx context.Context) {
+func (f *udpFlow) run(sessionCtx, ctx context.Context) {
 	defer f.close(ctx, false)
 	started := false
 messages:
@@ -271,7 +271,7 @@ messages:
 							UDPBatch bool `msgpack:"udp_batch_v1"`
 						}
 						if msgpack.Unmarshal(m.Body, &accept) != nil || !accept.UDPBatch {
-							f.close(ctx, true)
+							f.close(sessionCtx, true)
 							return
 						}
 						f.p.reportBatch.Do(func() { fmt.Println("Negotiated v3 UDP batching") })
@@ -280,6 +280,10 @@ messages:
 					started = true
 				}
 			case wspf.MessageTypePortForward:
+				if f.p.flowProto == protoTypePortForwardV3 && !started {
+					f.close(sessionCtx, true)
+					return
+				}
 				packets := [][]byte{m.Body}
 				var ack []byte
 				if f.p.flowProto == protoTypePortForwardV3 {
@@ -287,7 +291,7 @@ messages:
 					packets, err = splitDatagrams(m.Body)
 					if err != nil {
 						fmt.Fprintln(os.Stderr, err)
-						f.close(ctx, true)
+						f.close(sessionCtx, true)
 						return
 					}
 					ack = []byte{0, 0, 0, 1}
@@ -302,7 +306,7 @@ messages:
 						if f.p.flowProto != protoTypePortForwardV3 {
 							continue messages
 						}
-						f.close(ctx, true)
+						f.close(sessionCtx, true)
 						return
 					}
 				}
@@ -325,7 +329,7 @@ messages:
 				count := 1
 				if f.p.flowProto == protoTypePortForwardV3 {
 					if len(m.Body) != 4 {
-						f.close(ctx, true)
+						f.close(sessionCtx, true)
 						return
 					}
 					count = int(min(binary.BigEndian.Uint32(m.Body), uint32(cap(f.credits))))
@@ -339,6 +343,9 @@ messages:
 			case wspf.MessageTypePortForwardStop:
 				return
 			case wspf.MessageTypeError:
+				if started && f.p.flowProto == protoTypePortForwardV3 {
+					f.close(sessionCtx, true)
+				}
 				return
 			default:
 				continue
