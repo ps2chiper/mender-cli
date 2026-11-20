@@ -16,6 +16,7 @@ package cmd
 
 import (
 	"context"
+	"encoding/binary"
 	"fmt"
 	"net"
 	"os"
@@ -35,6 +36,8 @@ const (
 	portForwardUDPChannelSize = 20
 	portForwardUDPQueueSize   = 256
 	portForwardUDPWindow      = 3
+	portForwardV3UDPQueue     = 1024
+	portForwardUDPQueueBytes  = 2 * 1024 * 1024
 	portForwardUDPMaxFlows    = 64
 	portForwardUDPIdle        = 30 * time.Second
 	portForwardUDPSweep       = 5 * time.Second
@@ -46,14 +49,15 @@ const (
 // cannot be misrouted between clients. This is the useful part of chisel's
 // per-source UDP flow table, expressed with Mender connection IDs.
 type UDPPortForwarder struct {
-	conn       *net.UDPConn
-	remoteHost string
-	remotePort uint16
-	proto      ws.ProtoType
-	flowProto  ws.ProtoType
-	sessionID  string
-	msgChan    chan *ws.ProtoMsg
-	recvChans  map[string]forwardInbox
+	reportBatch sync.Once
+	conn        *net.UDPConn
+	remoteHost  string
+	remotePort  uint16
+	proto       ws.ProtoType
+	flowProto   ws.ProtoType
+	sessionID   string
+	msgChan     chan *ws.ProtoMsg
+	recvChans   map[string]forwardInbox
 	// recvMu protects both the per-source flows and their entries in recvChans.
 	recvMu *sync.RWMutex
 	flows  map[string]*udpFlow
@@ -67,6 +71,8 @@ type udpFlow struct {
 	sendChan     chan []byte
 	credits      chan struct{}
 	lastSeen     atomic.Int64
+	queuedBytes  atomic.Int64
+	overflow     sync.Once
 	cancel       context.CancelFunc
 	closed       atomic.Bool
 }
@@ -96,11 +102,6 @@ func NewUDPPortForwarder(
 	_ = conn.SetReadBuffer(4 * 1024 * 1024)
 	_ = conn.SetWriteBuffer(4 * 1024 * 1024)
 	flowProto := proto
-	if flowProto == protoTypePortForwardV3 {
-		// v3 UDP source fan-out uses the stable v2 datagram transport; each
-		// source has a separate connection and target socket.
-		flowProto = ws.ProtoTypePortForwardV2
-	}
 	return &UDPPortForwarder{
 		proto:      proto,
 		flowProto:  flowProto,
@@ -130,7 +131,11 @@ func (p *UDPPortForwarder) Run(
 }
 
 func (p *UDPPortForwarder) readLoop(ctx context.Context) {
-	buffer := make([]byte, readBuffLength)
+	size := readBuffLength
+	if p.flowProto == protoTypePortForwardV3 {
+		size = udpMaxDatagram + 1
+	}
+	buffer := make([]byte, size)
 	for {
 		_ = p.conn.SetReadDeadline(time.Now().Add(time.Second))
 		n, source, err := p.conn.ReadFromUDP(buffer)
@@ -150,11 +155,15 @@ func (p *UDPPortForwarder) readLoop(ctx context.Context) {
 			}
 			return
 		}
-		if n == 0 {
+		if n > udpMaxDatagram || (n == 0 && p.flowProto != protoTypePortForwardV3) {
 			continue
 		}
 		flow := p.flowFor(ctx, source)
 		if flow == nil {
+			continue
+		}
+		if flow.queuedBytes.Add(int64(n)) > portForwardUDPQueueBytes {
+			flow.dropQueued(n)
 			continue
 		}
 		data := make([]byte, n)
@@ -163,9 +172,14 @@ func (p *UDPPortForwarder) readLoop(ctx context.Context) {
 		case flow.sendChan <- data:
 			flow.lastSeen.Store(time.Now().UnixNano())
 		default:
-			// This source's bounded queue is full; UDP remains best effort.
+			flow.dropQueued(n)
 		}
 	}
+}
+
+func (f *udpFlow) dropQueued(n int) {
+	f.queuedBytes.Add(-int64(n))
+	f.overflow.Do(func() { fmt.Fprintf(os.Stderr, "port-forward UDP queue full for %s; dropping datagrams\n", f.source) })
 }
 
 func (p *UDPPortForwarder) flowFor(ctx context.Context, source *net.UDPAddr) *udpFlow {
@@ -188,6 +202,11 @@ func (p *UDPPortForwarder) flowFor(ctx context.Context, source *net.UDPAddr) *ud
 	if isFlowControlledPortForward(p.flowProto) {
 		window = portForwardUDPWindow
 	}
+	queue := portForwardUDPQueueSize
+	if p.flowProto == protoTypePortForwardV3 {
+		queue = portForwardV3UDPQueue
+		window = portForwardV3TCPWindow
+	}
 	flowCtx, cancel := context.WithCancel(ctx)
 	flow := &udpFlow{
 		cancel:       cancel,
@@ -195,7 +214,7 @@ func (p *UDPPortForwarder) flowFor(ctx context.Context, source *net.UDPAddr) *ud
 		source:       source,
 		connectionID: connectionID,
 		recvChan:     make(chan *ws.ProtoMsg, portForwardUDPChannelSize),
-		sendChan:     make(chan []byte, portForwardUDPQueueSize),
+		sendChan:     make(chan []byte, queue),
 		credits:      make(chan struct{}, window),
 	}
 	for i := 0; i < window; i++ {
@@ -218,6 +237,7 @@ func (p *UDPPortForwarder) sendNew(ctx context.Context, flow *udpFlow) {
 		RemoteHost:  &p.remoteHost,
 		RemotePort:  &p.remotePort,
 		FlowControl: isFlowControlledPortForward(p.flowProto),
+		UDPBatch:    p.flowProto == protoTypePortForwardV3,
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %v\n", err)
@@ -239,24 +259,58 @@ func (p *UDPPortForwarder) sendNew(ctx context.Context, flow *udpFlow) {
 func (f *udpFlow) run(ctx context.Context) {
 	defer f.close(ctx, false)
 	started := false
+messages:
 	for {
 		select {
 		case m := <-f.recvChan:
 			switch m.Header.MsgType {
 			case wspf.MessageTypePortForwardNew:
 				if !started {
+					if f.p.flowProto == protoTypePortForwardV3 {
+						var accept struct {
+							UDPBatch bool `msgpack:"udp_batch_v1"`
+						}
+						if msgpack.Unmarshal(m.Body, &accept) != nil || !accept.UDPBatch {
+							f.close(ctx, true)
+							return
+						}
+						f.p.reportBatch.Do(func() { fmt.Println("Negotiated v3 UDP batching") })
+					}
 					go f.sendLoop(ctx)
 					started = true
 				}
 			case wspf.MessageTypePortForward:
-				if _, err := f.p.conn.WriteToUDP(m.Body, f.source); err != nil {
-					fmt.Fprintf(os.Stderr, "error: %v\n", err)
-					continue
+				packets := [][]byte{m.Body}
+				var ack []byte
+				if f.p.flowProto == protoTypePortForwardV3 {
+					var err error
+					packets, err = splitDatagrams(m.Body)
+					if err != nil {
+						fmt.Fprintln(os.Stderr, err)
+						f.close(ctx, true)
+						return
+					}
+					ack = []byte{0, 0, 0, 1}
+				}
+				start := time.Now()
+				for i, packet := range packets {
+					if f.p.flowProto == protoTypePortForwardV3 {
+						paceGroup(start, m.Body, i, len(packets))
+					}
+					if _, err := f.p.conn.WriteToUDP(packet, f.source); err != nil {
+						fmt.Fprintln(os.Stderr, err)
+						if f.p.flowProto != protoTypePortForwardV3 {
+							continue messages
+						}
+						f.close(ctx, true)
+						return
+					}
 				}
 				f.lastSeen.Store(time.Now().UnixNano())
 				if f.p.flowProto == ws.ProtoTypePortForward ||
 					isFlowControlledPortForward(f.p.flowProto) {
 					sendForwardMessage(ctx, f.p.msgChan, &ws.ProtoMsg{
+						Body: ack,
 						Header: ws.ProtoHdr{
 							Proto:     f.p.flowProto,
 							MsgType:   wspf.MessageTypePortForwardAck,
@@ -268,9 +322,19 @@ func (f *udpFlow) run(ctx context.Context) {
 					})
 				}
 			case wspf.MessageTypePortForwardAck:
-				select {
-				case f.credits <- struct{}{}:
-				default:
+				count := 1
+				if f.p.flowProto == protoTypePortForwardV3 {
+					if len(m.Body) != 4 {
+						f.close(ctx, true)
+						return
+					}
+					count = int(min(binary.BigEndian.Uint32(m.Body), uint32(cap(f.credits))))
+				}
+				for i := 0; i < count; i++ {
+					select {
+					case f.credits <- struct{}{}:
+					default:
+					}
 				}
 			case wspf.MessageTypePortForwardStop:
 				return
@@ -289,6 +353,10 @@ func (f *udpFlow) sendLoop(ctx context.Context) {
 	for {
 		select {
 		case data := <-f.sendChan:
+			f.queuedBytes.Add(-int64(len(data)))
+			if f.p.flowProto == protoTypePortForwardV3 {
+				data = f.batch(ctx, data)
+			}
 			select {
 			case <-f.credits:
 			case <-ctx.Done():
@@ -313,6 +381,25 @@ func (f *udpFlow) sendLoop(ctx context.Context) {
 			return
 		}
 	}
+}
+
+func (f *udpFlow) batch(ctx context.Context, first []byte) []byte {
+	start := time.Now()
+	body := appendDatagram(nil, first)
+	timer := time.NewTimer(udpBatchDelay)
+	defer timer.Stop()
+	for n := 1; n < udpBatchCount && len(body)+udpMaxDatagram+2 <= udpBatchFrame; n++ {
+		select {
+		case packet := <-f.sendChan:
+			f.queuedBytes.Add(-int64(len(packet)))
+			body = appendDatagram(body, packet)
+		case <-timer.C:
+			return finishBatch(body, start)
+		case <-ctx.Done():
+			return finishBatch(body, start)
+		}
+	}
+	return finishBatch(body, start)
 }
 
 func (f *udpFlow) close(ctx context.Context, sendStop bool) {

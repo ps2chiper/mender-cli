@@ -100,6 +100,7 @@ func isFlowControlledPortForward(proto ws.ProtoType) bool {
 // flow-control flag. deviceconnect proxies preserve the body untouched, while
 // header properties are metadata and may be dropped by an intermediate proxy.
 type portForwardNewBody struct {
+	UDPBatch        bool                      `msgpack:"udp_batch_v1,omitempty"`
 	RemoteHost      *string                   `msgpack:"remote_host"`
 	RemotePort      *uint16                   `msgpack:"remote_port"`
 	Protocol        *wspf.PortForwardProtocol `msgpack:"protocol"`
@@ -124,6 +125,7 @@ func sendForwardMessage(ctx context.Context, out chan<- *ws.ProtoMsg, msg *ws.Pr
 
 // PortForwardCmd handles the port-forward command
 type PortForwardCmd struct {
+	udpBatch     bool
 	proto        ws.ProtoType
 	server       string
 	token        string
@@ -281,9 +283,7 @@ func (c *PortForwardCmd) run() error {
 			go forwarder.Run(ctx, c.sessionID, msgChan, c.recvChans, &c.recvMu)
 		case protocolUDP:
 			udpProto := c.proto
-			if udpProto == protoTypePortForwardV3 {
-				// v3 credit batching is TCP-only in the prototype; UDP keeps
-				// the stable v2 flow path.
+			if udpProto == protoTypePortForwardV3 && !c.udpBatch {
 				udpProto = ws.ProtoTypePortForwardV2
 			}
 			forwarder, err := NewUDPPortForwarder(c.bindingHost, portMapping.LocalPort,
@@ -385,8 +385,11 @@ func (c *PortForwardCmd) handshake(client *deviceconnect.Client) error {
 		return errPortForwardNotImplemented
 	}
 
-	accept := new(ws.Accept)
-	err = msgpack.Unmarshal(msg.Body, accept)
+	var accept struct {
+		Protocols []ws.ProtoType `msgpack:"protocols"`
+		UDPBatch  bool           `msgpack:"udp_batch_v1"`
+	}
+	err = msgpack.Unmarshal(msg.Body, &accept)
 	if err != nil {
 		return err
 	}
@@ -400,6 +403,7 @@ func (c *PortForwardCmd) handshake(client *deviceconnect.Client) error {
 		return errPortForwardNotImplemented
 	}
 
+	c.udpBatch = accept.UDPBatch && c.proto == protoTypePortForwardV3
 	c.sessionID = msg.Header.SessionID
 	return nil
 }
